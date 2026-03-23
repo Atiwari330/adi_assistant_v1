@@ -13,6 +13,14 @@ export const MAX_THREAD_MESSAGES_FOR_LLM = 5;
 /** Max standalone messages to batch in a single LLM call */
 export const MAX_BATCH_SIZE_FOR_LLM = 10;
 
+/** Triage model — cheap, used for message classification (via Vercel AI Gateway) */
+export const TRIAGE_MODEL = "deepseek/deepseek-v3.2";
+export const TRIAGE_MODEL_NAME = "deepseek-v3.2";
+
+/** Analysis model — expensive, used for deep action item extraction */
+export const ANALYSIS_MODEL = "claude-sonnet-4-20250514";
+export const ANALYSIS_MODEL_NAME = "claude-sonnet-4-20250514";
+
 /** Default page size for paginated API responses */
 export const DEFAULT_PAGE_SIZE = 20;
 

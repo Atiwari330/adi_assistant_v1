@@ -1,16 +1,24 @@
 import { anthropic } from "@ai-sdk/anthropic";
+import { gateway } from "@ai-sdk/gateway";
+import { TRIAGE_MODEL, ANALYSIS_MODEL } from "@/lib/constants";
 
 /**
- * Get the AI model for action item extraction.
- *
- * Uses Anthropic's Claude via the @ai-sdk/anthropic provider.
- * In production on Vercel, this can be swapped to use the AI Gateway
- * by changing to: gateway("anthropic/claude-sonnet-4-20250514")
- *
- * The model choice balances quality and cost:
- * - Claude Sonnet for day-to-day processing (fast, cost-effective)
- * - Could upgrade to Claude Opus for complex threads if needed
+ * Cheap triage model for message classification.
+ * Uses DeepSeek V3.2 via Vercel AI Gateway (~10-35x cheaper than Claude Sonnet).
  */
+export function getTriageModel() {
+  return gateway(TRIAGE_MODEL);
+}
+
+/**
+ * Full analysis model for deep action item extraction.
+ * Uses Claude Sonnet 4 for nuanced reasoning, delegation, and complex threads.
+ */
+export function getAnalysisModel() {
+  return anthropic(ANALYSIS_MODEL);
+}
+
+/** @deprecated Use getAnalysisModel() instead */
 export function getModel() {
-  return anthropic("claude-sonnet-4-20250514");
+  return getAnalysisModel();
 }

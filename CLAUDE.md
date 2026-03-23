@@ -14,9 +14,9 @@ npx supabase gen types --lang=typescript --project-id wlusojgyrjkmsbcylytn > src
 
 ## Architecture
 
-AI-powered work assistant that syncs Gmail and Slack, processes messages through Claude, and generates prioritized action items. Next.js 16 App Router, Supabase (Postgres + Auth + RLS), Vercel AI SDK v6, deployed on Vercel with cron jobs.
+AI-powered work assistant that syncs Gmail and Slack, processes messages through a two-stage LLM pipeline, and generates prioritized action items. Next.js 16 App Router, Supabase (Postgres + Auth + RLS), Vercel AI SDK v6, deployed on Vercel with cron jobs.
 
-### Data Pipeline
+### Data Pipeline (Two-Stage)
 
 ```
 Vercel Cron (every 5m)
@@ -25,11 +25,16 @@ Vercel Cron (every 5m)
     → Incremental fetch (Gmail historyId, Slack per-channel cursors)
     → Pre-LLM filtering (src/lib/ingestion/filter.ts)
     → Store in source_messages (status: pending)
-  → LLM Pipeline (src/lib/ai/pipeline.ts)
-    → Batch by thread, enrich with user context + rules
-    → generateObject() with Zod schema (src/lib/ai/schemas.ts)
+  → Stage 1: Triage (DeepSeek V3.2 via AI Gateway — cheap)
+    → Classifies messages: no_action / action_needed / needs_deeper_analysis
+    → High-confidence simple items → create action items directly
+    → Ambiguous, high-stakes, or low-confidence → escalate to Stage 2
+  → Stage 2: Analysis (Claude Sonnet 4 — only escalated messages)
+    → Full action item extraction with delegation, rules, reasoning
     → Store action_items + action_item_sources
 ```
+
+Model constants in `src/lib/constants.ts`. Triage schema in `src/lib/ai/triage-schema.ts`, triage prompts in `src/lib/ai/triage-prompts.ts`. Provider functions (`getTriageModel()`, `getAnalysisModel()`) in `src/lib/ai/provider.ts`. The `action_items.llm_model` column tracks which model created each item.
 
 ### Three Supabase Clients
 
@@ -75,7 +80,9 @@ Follow the Gmail/Slack pattern: create `src/lib/integrations/<name>/client.ts` (
 - **Change how specific senders are handled:** Add `processing_rules` — these inject per-sender instructions into the LLM prompt and can override priority.
 - **Change what gets filtered before the LLM sees it:** Add `filter_rules` or modify `DEFAULT_EXCLUDED_SENDERS` in `src/lib/constants.ts`.
 - **Change action item structure:** Modify the Zod schema in `src/lib/ai/schemas.ts` and update the pipeline in `pipeline.ts` to handle new fields. Update the `action_items` table via a new migration.
-- **Change the model:** Edit `src/lib/ai/provider.ts`. The pipeline uses `generateObject()` which requires a model that supports structured output.
+- **Change the triage model:** Edit `TRIAGE_MODEL` in `src/lib/constants.ts`. Must support structured output via Vercel AI Gateway.
+- **Change the analysis model:** Edit `ANALYSIS_MODEL` in `src/lib/constants.ts`. Provider functions in `src/lib/ai/provider.ts`.
+- **Adjust escalation behavior:** Edit `src/lib/ai/triage-prompts.ts` to change what gets escalated to the expensive model.
 
 ## Gotchas
 

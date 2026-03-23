@@ -6,31 +6,38 @@ import type {
   UserProfile,
   Contact,
   ProcessingRule,
-  Json,
 } from "@/types/database";
-import { getModel } from "./provider";
+import { getTriageModel, getAnalysisModel } from "./provider";
 import { ActionItemExtractionSchema, type ExtractedActionItem } from "./schemas";
+import { TriageClassificationSchema, type TriageMessageResult } from "./triage-schema";
 import { buildSystemPrompt, buildUserPrompt } from "./prompts";
-import { MAX_BATCH_SIZE_FOR_LLM } from "@/lib/constants";
+import { buildTriageSystemPrompt } from "./triage-prompts";
+import {
+  MAX_BATCH_SIZE_FOR_LLM,
+  TRIAGE_MODEL_NAME,
+  ANALYSIS_MODEL_NAME,
+} from "@/lib/constants";
 
 export interface PipelineResult {
   actionItemsCreated: number;
   messagesProcessed: number;
   messagesSkipped: number;
+  messagesEscalated: number;
   errors: number;
   totalPromptTokens: number;
   totalCompletionTokens: number;
 }
 
 /**
- * Run the LLM processing pipeline for a user.
+ * Run the two-stage LLM processing pipeline for a user.
  *
- * Flow:
- * 1. Query pending source_messages
- * 2. Load user profile, contacts, processing rules
- * 3. Group messages by thread (or batch standalone messages)
- * 4. For each batch: build prompt → generateObject → store action items
- * 5. Update source_messages to 'processed'
+ * Stage 1 (Triage): Cheap model classifies all messages
+ *   - no_action → mark processed, skip
+ *   - action_needed + high confidence → create action item directly
+ *   - needs_deeper_analysis or low confidence → escalate to Stage 2
+ *
+ * Stage 2 (Analysis): Expensive model processes only escalated messages
+ *   - Full action item extraction with delegation, reasoning, rules context
  */
 export async function runPipeline(
   supabase: SupabaseClient<Database>,
@@ -39,6 +46,7 @@ export async function runPipeline(
   let actionItemsCreated = 0;
   let messagesProcessed = 0;
   let messagesSkipped = 0;
+  let messagesEscalated = 0;
   let errors = 0;
   let totalPromptTokens = 0;
   let totalCompletionTokens = 0;
@@ -59,6 +67,7 @@ export async function runPipeline(
       actionItemsCreated: 0,
       messagesProcessed: 0,
       messagesSkipped: 0,
+      messagesEscalated: 0,
       errors: 0,
       totalPromptTokens: 0,
       totalCompletionTokens: 0,
@@ -99,6 +108,7 @@ export async function runPipeline(
       actionItemsCreated: 0,
       messagesProcessed: 0,
       messagesSkipped: 0,
+      messagesEscalated: 0,
       errors: 1,
       totalPromptTokens: 0,
       totalCompletionTokens: 0,
@@ -108,9 +118,13 @@ export async function runPipeline(
   // 3. Group messages into batches
   const batches = groupIntoBatches(pendingMessages);
 
-  // 4. Process each batch
+  // Collect messages that need escalation to Stage 2
+  const escalatedMessages: SourceMessage[] = [];
+
+  // =========================================================================
+  // STAGE 1: Triage (cheap model — DeepSeek V3.2)
+  // =========================================================================
   for (const batch of batches) {
-    // Mark messages as processing
     await supabase
       .from("source_messages")
       .update({ processing_status: "processing" as const })
@@ -120,153 +134,181 @@ export async function runPipeline(
       );
 
     try {
-      // Find applicable per-sender rules for this batch
-      const applicableRules = findApplicableRules(batch, rules);
-
-      // Build prompts
-      const systemPrompt =
-        profile.system_prompt_override ??
-        buildSystemPrompt(profile, contacts, applicableRules);
+      const triagePrompt = buildTriageSystemPrompt(profile);
       const userPrompt = buildUserPrompt(batch);
 
-      // Call LLM
-      const { object: extraction, usage } = await generateObject({
-        model: getModel(),
-        schema: ActionItemExtractionSchema,
-        system: systemPrompt,
+      const { object: triage, usage } = await generateObject({
+        model: getTriageModel(),
+        schema: TriageClassificationSchema,
+        system: triagePrompt,
         prompt: userPrompt,
       });
 
-      const promptTokens = usage.inputTokens ?? 0;
-      const completionTokens = usage.outputTokens ?? 0;
-      totalPromptTokens += promptTokens;
-      totalCompletionTokens += completionTokens;
+      totalPromptTokens += usage.inputTokens ?? 0;
+      totalCompletionTokens += usage.outputTokens ?? 0;
 
-      // Store action items (with thread-level dedup)
-      for (const item of extraction.items) {
-        const sourceMessage = batch[item.sourceMessageIndex];
+      for (const result of triage.messages) {
+        const sourceMessage = batch[result.sourceMessageIndex];
         if (!sourceMessage) continue;
 
-        // Dedup: if this message belongs to a thread, check if an active
-        // action item already exists from the same thread
-        if (sourceMessage.thread_id) {
-          // Find other source messages from the same thread
-          const { data: threadMsgs } = await supabase
-            .from("source_messages")
-            .select("id")
-            .eq("user_id", userId)
-            .eq("thread_id", sourceMessage.thread_id);
-
-          if (threadMsgs && threadMsgs.length > 0) {
-            const threadMsgIds = threadMsgs.map((m) => m.id);
-            // Check if any of those messages already link to an action item
-            const { data: existingLinks } = await supabase
-              .from("action_item_sources")
-              .select("action_item_id")
-              .in("source_message_id", threadMsgIds)
-              .limit(5);
-
-            if (existingLinks && existingLinks.length > 0) {
-              // Check if any linked action item is still active
-              const linkedIds = [...new Set(existingLinks.map((l) => l.action_item_id))];
-              const { data: activeItems } = await supabase
-                .from("action_items")
-                .select("id")
-                .in("id", linkedIds)
-                .eq("user_id", userId)
-                .not("status", "in", '("done","dismissed")')
-                .limit(1);
-
-              if (activeItems && activeItems.length > 0) {
-                // Link this source message to the existing action item instead
-                await supabase.from("action_item_sources").insert({
-                  action_item_id: activeItems[0]!.id,
-                  source_message_id: sourceMessage.id,
-                  is_primary: false,
-                });
-                continue; // Skip creating a duplicate
-              }
-            }
-          }
-        }
-
-        // Find suggested delegate contact
-        const delegateContact = item.suggestedDelegateTo
-          ? findContactByName(contacts, item.suggestedDelegateTo)
-          : null;
-
-        // Check if a rule overrides the priority
-        const priorityOverride = findPriorityOverride(sourceMessage, rules);
-        const finalPriority = priorityOverride ?? item.priority;
-
-        // Insert action item
-        const { data: actionItem, error: insertError } = await supabase
-          .from("action_items")
-          .insert({
-            user_id: userId,
-            title: item.title.slice(0, 200),
-            summary: item.summary,
-            action_type: item.actionType,
-            priority: finalPriority,
-            status: "new" as const,
-            suggested_delegate: delegateContact?.id ?? null,
-            delegate_reason: item.delegateReason,
-            ai_reasoning: item.reasoning,
-            llm_model: "claude-sonnet-4-20250514",
-            llm_prompt_tokens: promptTokens,
-            llm_completion_tokens: completionTokens,
-          })
-          .select("id")
-          .single();
-
-        if (insertError) {
-          console.error("Failed to insert action item:", insertError);
-          errors++;
+        if (result.classification === "no_action") {
+          // Skip — no action needed
+          messagesSkipped++;
           continue;
         }
 
-        // Link action item to source message
-        if (actionItem) {
-          await supabase.from("action_item_sources").insert({
-            action_item_id: actionItem.id,
-            source_message_id: sourceMessage.id,
-            is_primary: true,
-          });
+        if (result.classification === "needs_deeper_analysis") {
+          // Escalate to Stage 2
+          escalatedMessages.push(sourceMessage);
+          messagesEscalated++;
+          continue;
         }
 
-        actionItemsCreated++;
+        // action_needed — check confidence
+        if (result.confidence !== "high") {
+          // Medium/low confidence → escalate to be safe
+          escalatedMessages.push(sourceMessage);
+          messagesEscalated++;
+          continue;
+        }
+
+        // High-confidence action_needed → create action item directly from triage
+        const created = await createActionItem(
+          supabase,
+          userId,
+          sourceMessage,
+          {
+            title: result.preliminaryTitle,
+            summary: result.preliminarySummary,
+            actionType: result.preliminaryActionType,
+            priority: result.preliminaryPriority,
+            reasoning: result.escalationReason ?? "Identified by triage model",
+            suggestedDelegateTo: null,
+            delegateReason: null,
+            sourceMessageIndex: result.sourceMessageIndex,
+          },
+          contacts,
+          rules,
+          TRIAGE_MODEL_NAME,
+          usage.inputTokens ?? 0,
+          usage.outputTokens ?? 0,
+        );
+
+        if (created) {
+          actionItemsCreated++;
+        } else {
+          errors++;
+        }
       }
 
-      // Mark all messages in batch as processed
-      await supabase
-        .from("source_messages")
-        .update({
-          processing_status: "processed" as const,
-          processed_at: new Date().toISOString(),
-        })
-        .in(
-          "id",
-          batch.map((m) => m.id),
-        );
+      // Mark non-escalated messages as processed
+      const escalatedIds = new Set(escalatedMessages.map((m) => m.id));
+      const processedIds = batch
+        .filter((m) => !escalatedIds.has(m.id))
+        .map((m) => m.id);
 
-      messagesProcessed += batch.length;
-      messagesSkipped += extraction.noActionNeeded.length;
+      if (processedIds.length > 0) {
+        await supabase
+          .from("source_messages")
+          .update({
+            processing_status: "processed" as const,
+            processed_at: new Date().toISOString(),
+          })
+          .in("id", processedIds);
+      }
+
+      messagesProcessed += processedIds.length;
     } catch (err) {
-      console.error("LLM pipeline batch error:", err);
+      console.error("Triage stage error:", err);
 
-      // Mark messages as error so they can be retried next cycle
-      await supabase
-        .from("source_messages")
-        .update({
-          processing_status: "error" as const,
-          processing_error: err instanceof Error ? err.message : "Unknown LLM error",
-        })
-        .in(
-          "id",
-          batch.map((m) => m.id),
-        );
+      // On triage failure, escalate entire batch to Stage 2 as fallback
+      escalatedMessages.push(...batch);
+      messagesEscalated += batch.length;
+    }
+  }
 
-      errors += batch.length;
+  // =========================================================================
+  // STAGE 2: Deep Analysis (expensive model — Claude Sonnet 4)
+  // Only processes escalated messages
+  // =========================================================================
+  if (escalatedMessages.length > 0) {
+    const escalatedBatches = groupIntoBatches(escalatedMessages);
+
+    for (const batch of escalatedBatches) {
+      try {
+        const applicableRules = findApplicableRules(batch, rules);
+
+        const systemPrompt =
+          profile.system_prompt_override ??
+          buildSystemPrompt(profile, contacts, applicableRules);
+        const userPrompt = buildUserPrompt(batch);
+
+        const { object: extraction, usage } = await generateObject({
+          model: getAnalysisModel(),
+          schema: ActionItemExtractionSchema,
+          system: systemPrompt,
+          prompt: userPrompt,
+        });
+
+        const promptTokens = usage.inputTokens ?? 0;
+        const completionTokens = usage.outputTokens ?? 0;
+        totalPromptTokens += promptTokens;
+        totalCompletionTokens += completionTokens;
+
+        for (const item of extraction.items) {
+          const sourceMessage = batch[item.sourceMessageIndex];
+          if (!sourceMessage) continue;
+
+          const created = await createActionItem(
+            supabase,
+            userId,
+            sourceMessage,
+            item,
+            contacts,
+            rules,
+            ANALYSIS_MODEL_NAME,
+            promptTokens,
+            completionTokens,
+          );
+
+          if (created) {
+            actionItemsCreated++;
+          } else {
+            errors++;
+          }
+        }
+
+        // Mark escalated messages as processed
+        await supabase
+          .from("source_messages")
+          .update({
+            processing_status: "processed" as const,
+            processed_at: new Date().toISOString(),
+          })
+          .in(
+            "id",
+            batch.map((m) => m.id),
+          );
+
+        messagesProcessed += batch.length;
+        messagesSkipped += extraction.noActionNeeded.length;
+      } catch (err) {
+        console.error("Analysis stage error:", err);
+
+        await supabase
+          .from("source_messages")
+          .update({
+            processing_status: "error" as const,
+            processing_error:
+              err instanceof Error ? err.message : "Unknown LLM error",
+          })
+          .in(
+            "id",
+            batch.map((m) => m.id),
+          );
+
+        errors += batch.length;
+      }
     }
   }
 
@@ -274,11 +316,117 @@ export async function runPipeline(
     actionItemsCreated,
     messagesProcessed,
     messagesSkipped,
+    messagesEscalated,
     errors,
     totalPromptTokens,
     totalCompletionTokens,
   };
 }
+
+// =============================================================================
+// Action Item Creation (shared by both stages)
+// =============================================================================
+
+/**
+ * Create an action item with thread-level dedup.
+ * Returns true if created, false if skipped or errored.
+ */
+async function createActionItem(
+  supabase: SupabaseClient<Database>,
+  userId: string,
+  sourceMessage: SourceMessage,
+  item: ExtractedActionItem,
+  contacts: Contact[],
+  rules: ProcessingRule[],
+  modelName: string,
+  promptTokens: number,
+  completionTokens: number,
+): Promise<boolean> {
+  // Thread-level dedup
+  if (sourceMessage.thread_id) {
+    const { data: threadMsgs } = await supabase
+      .from("source_messages")
+      .select("id")
+      .eq("user_id", userId)
+      .eq("thread_id", sourceMessage.thread_id);
+
+    if (threadMsgs && threadMsgs.length > 0) {
+      const threadMsgIds = threadMsgs.map((m) => m.id);
+      const { data: existingLinks } = await supabase
+        .from("action_item_sources")
+        .select("action_item_id")
+        .in("source_message_id", threadMsgIds)
+        .limit(5);
+
+      if (existingLinks && existingLinks.length > 0) {
+        const linkedIds = [
+          ...new Set(existingLinks.map((l) => l.action_item_id)),
+        ];
+        const { data: activeItems } = await supabase
+          .from("action_items")
+          .select("id")
+          .in("id", linkedIds)
+          .eq("user_id", userId)
+          .not("status", "in", '("done","dismissed")')
+          .limit(1);
+
+        if (activeItems && activeItems.length > 0) {
+          await supabase.from("action_item_sources").insert({
+            action_item_id: activeItems[0]!.id,
+            source_message_id: sourceMessage.id,
+            is_primary: false,
+          });
+          return true; // Linked to existing — counts as success, not a new item
+        }
+      }
+    }
+  }
+
+  const delegateContact = item.suggestedDelegateTo
+    ? findContactByName(contacts, item.suggestedDelegateTo)
+    : null;
+
+  const priorityOverride = findPriorityOverride(sourceMessage, rules);
+  const finalPriority = priorityOverride ?? item.priority;
+
+  const { data: actionItem, error: insertError } = await supabase
+    .from("action_items")
+    .insert({
+      user_id: userId,
+      title: item.title.slice(0, 200),
+      summary: item.summary,
+      action_type: item.actionType,
+      priority: finalPriority,
+      status: "new" as const,
+      suggested_delegate: delegateContact?.id ?? null,
+      delegate_reason: item.delegateReason,
+      ai_reasoning: item.reasoning,
+      llm_model: modelName,
+      llm_prompt_tokens: promptTokens,
+      llm_completion_tokens: completionTokens,
+    })
+    .select("id")
+    .single();
+
+  if (insertError) {
+    console.error("Failed to insert action item:", insertError);
+    return false;
+  }
+
+  if (actionItem) {
+    await supabase.from("action_item_sources").insert({
+      action_item_id: actionItem.id,
+      source_message_id: sourceMessage.id,
+      is_primary: true,
+    });
+  }
+
+  return true;
+}
+
+// =============================================================================
+// Helper Functions
+// =============================================================================
 
 /**
  * Group messages into processing batches.
@@ -300,12 +448,10 @@ function groupIntoBatches(messages: SourceMessage[]): SourceMessage[][] {
     }
   }
 
-  // Each thread group is its own batch
   for (const threadMessages of threadGroups.values()) {
     batches.push(threadMessages);
   }
 
-  // Batch standalone messages
   for (let i = 0; i < standalone.length; i += MAX_BATCH_SIZE_FOR_LLM) {
     batches.push(standalone.slice(i, i + MAX_BATCH_SIZE_FOR_LLM));
   }
@@ -313,9 +459,6 @@ function groupIntoBatches(messages: SourceMessage[]): SourceMessage[][] {
   return batches;
 }
 
-/**
- * Find processing rules that apply to any sender in the batch.
- */
 function findApplicableRules(
   messages: SourceMessage[],
   allRules: ProcessingRule[],
@@ -326,9 +469,7 @@ function findApplicableRules(
   for (const msg of messages) {
     for (const rule of allRules) {
       if (applicable.has(rule.id)) continue;
-
-      const matches = doesRuleMatchMessage(rule, msg);
-      if (matches) {
+      if (doesRuleMatchMessage(rule, msg)) {
         applicable.add(rule.id);
         result.push(rule);
       }
@@ -338,10 +479,10 @@ function findApplicableRules(
   return result;
 }
 
-/**
- * Check if a processing rule matches a specific message.
- */
-function doesRuleMatchMessage(rule: ProcessingRule, msg: SourceMessage): boolean {
+function doesRuleMatchMessage(
+  rule: ProcessingRule,
+  msg: SourceMessage,
+): boolean {
   const senderAddress = (msg.sender_address ?? "").toLowerCase();
   const senderDomain = senderAddress.split("@")[1] ?? "";
 
@@ -351,7 +492,7 @@ function doesRuleMatchMessage(rule: ProcessingRule, msg: SourceMessage): boolean
     case "email_domain":
       return senderDomain === rule.match_value.toLowerCase();
     case "slack_user_id":
-      return msg.sender_address === rule.match_value; // For Slack, sender_address is user ID
+      return msg.sender_address === rule.match_value;
     case "slack_channel":
       return msg.channel_id === rule.match_value;
     default:
@@ -359,9 +500,6 @@ function doesRuleMatchMessage(rule: ProcessingRule, msg: SourceMessage): boolean
   }
 }
 
-/**
- * Find a priority override from rules for a specific message.
- */
 function findPriorityOverride(
   msg: SourceMessage,
   rules: ProcessingRule[],
@@ -374,26 +512,23 @@ function findPriorityOverride(
   return null;
 }
 
-/**
- * Find a contact by name (fuzzy match for delegation suggestions).
- */
-function findContactByName(contacts: Contact[], name: string): Contact | null {
+function findContactByName(
+  contacts: Contact[],
+  name: string,
+): Contact | null {
   const normalized = name.toLowerCase().trim();
 
-  // Exact match
   const exact = contacts.find(
     (c) => c.full_name.toLowerCase() === normalized,
   );
   if (exact) return exact;
 
-  // Partial match (first name or last name)
   const partial = contacts.find((c) => {
     const parts = c.full_name.toLowerCase().split(/\s+/);
     return parts.some((p) => p === normalized);
   });
   if (partial) return partial;
 
-  // Contains match
   const contains = contacts.find((c) =>
     c.full_name.toLowerCase().includes(normalized),
   );
