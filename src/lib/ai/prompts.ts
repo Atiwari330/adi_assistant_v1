@@ -115,11 +115,16 @@ export function buildSystemPrompt(
 - If a specific delegation rule exists for the sender, follow it
 - Always explain why this person is the right delegate
 
+### Thread & Deduplication Rules:
+- When multiple messages discuss the SAME topic, issue, or request, create ONE consolidated action item — not one per message
+- For threads: synthesize the full context into a single action item reflecting the latest state, and place the remaining messages in 'noActionNeeded' with reason "consolidated into another action item"
+- The consolidated item should reference the most recent/actionable message via sourceMessageIndex
+- Example: 3 emails about a customer payment issue = 1 action item, not 3
+
 ### Output Rules:
 - Keep titles under 120 characters
 - Summaries should be 2-3 sentences max
 - Be direct and action-oriented — "Approve $5K spend request from Sarah" not "Sarah sent a message about spending"
-- If processing a thread, focus on the LATEST message and what it means for the user
 - Every message must appear in either 'items' or 'noActionNeeded' — do not skip any`);
 
   return sections.join("\n");

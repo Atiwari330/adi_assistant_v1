@@ -142,10 +142,53 @@ export async function runPipeline(
       totalPromptTokens += promptTokens;
       totalCompletionTokens += completionTokens;
 
-      // Store action items
+      // Store action items (with thread-level dedup)
       for (const item of extraction.items) {
         const sourceMessage = batch[item.sourceMessageIndex];
         if (!sourceMessage) continue;
+
+        // Dedup: if this message belongs to a thread, check if an active
+        // action item already exists from the same thread
+        if (sourceMessage.thread_id) {
+          // Find other source messages from the same thread
+          const { data: threadMsgs } = await supabase
+            .from("source_messages")
+            .select("id")
+            .eq("user_id", userId)
+            .eq("thread_id", sourceMessage.thread_id);
+
+          if (threadMsgs && threadMsgs.length > 0) {
+            const threadMsgIds = threadMsgs.map((m) => m.id);
+            // Check if any of those messages already link to an action item
+            const { data: existingLinks } = await supabase
+              .from("action_item_sources")
+              .select("action_item_id")
+              .in("source_message_id", threadMsgIds)
+              .limit(5);
+
+            if (existingLinks && existingLinks.length > 0) {
+              // Check if any linked action item is still active
+              const linkedIds = [...new Set(existingLinks.map((l) => l.action_item_id))];
+              const { data: activeItems } = await supabase
+                .from("action_items")
+                .select("id")
+                .in("id", linkedIds)
+                .eq("user_id", userId)
+                .not("status", "in", '("done","dismissed")')
+                .limit(1);
+
+              if (activeItems && activeItems.length > 0) {
+                // Link this source message to the existing action item instead
+                await supabase.from("action_item_sources").insert({
+                  action_item_id: activeItems[0]!.id,
+                  source_message_id: sourceMessage.id,
+                  is_primary: false,
+                });
+                continue; // Skip creating a duplicate
+              }
+            }
+          }
+        }
 
         // Find suggested delegate contact
         const delegateContact = item.suggestedDelegateTo
