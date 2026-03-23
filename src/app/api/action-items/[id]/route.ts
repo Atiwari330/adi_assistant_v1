@@ -86,12 +86,20 @@ export async function GET(
       .order("created_at", { ascending: false })
       .limit(20);
 
+    // Fetch feedback
+    const { data: feedback } = await supabase
+      .from("action_item_feedback")
+      .select("id, category, comment, resolved, created_at")
+      .eq("action_item_id", id)
+      .order("created_at", { ascending: false });
+
     return Response.json({
       data: {
         ...item,
         suggested_delegate_name: delegateName,
         source_messages: sourceMessages,
         history: history ?? [],
+        feedback: feedback ?? [],
       },
     });
   } catch (error) {

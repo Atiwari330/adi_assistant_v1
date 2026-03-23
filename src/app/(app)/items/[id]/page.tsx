@@ -5,7 +5,7 @@ import { useParams, useRouter } from "next/navigation";
 import { PriorityBadge } from "@/components/ui/priority-badge";
 import { ActionTypeBadge } from "@/components/ui/action-type-badge";
 import { TimeAgo } from "@/components/ui/time-ago";
-import type { ActionType, PriorityLevel, ActionStatus } from "@/types/database";
+import type { ActionType, PriorityLevel, ActionStatus, FeedbackCategory } from "@/types/database";
 
 interface SourceMessageDetail {
   id: string;
@@ -17,6 +17,14 @@ interface SourceMessageDetail {
   body_text: string | null;
   message_timestamp: string;
   is_primary: boolean;
+}
+
+interface FeedbackEntry {
+  id: string;
+  category: FeedbackCategory;
+  comment: string;
+  resolved: boolean;
+  created_at: string;
 }
 
 interface HistoryEntry {
@@ -44,6 +52,7 @@ interface ActionItemDetail {
   suggested_delegate_name: string | null;
   source_messages: SourceMessageDetail[];
   history: HistoryEntry[];
+  feedback: FeedbackEntry[];
   metadata: Record<string, unknown>;
 }
 
@@ -53,6 +62,10 @@ export default function ActionItemDetailPage() {
   const [item, setItem] = useState<ActionItemDetail | null>(null);
   const [loading, setLoading] = useState(true);
   const [updating, setUpdating] = useState(false);
+  const [showFeedbackForm, setShowFeedbackForm] = useState(false);
+  const [feedbackCategory, setFeedbackCategory] = useState<FeedbackCategory>("other");
+  const [feedbackComment, setFeedbackComment] = useState("");
+  const [submittingFeedback, setSubmittingFeedback] = useState(false);
 
   useEffect(() => {
     async function load() {
@@ -91,6 +104,42 @@ export default function ActionItemDetailPage() {
       setUpdating(false);
     }
   }
+
+  async function submitFeedback() {
+    if (!feedbackComment.trim() || feedbackComment.length < 5) return;
+    setSubmittingFeedback(true);
+    try {
+      const res = await fetch(`/api/action-items/${params.id}/feedback`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ category: feedbackCategory, comment: feedbackComment }),
+      });
+      const data = await res.json();
+      if (res.ok && item) {
+        setItem({
+          ...item,
+          feedback: [data.data, ...item.feedback],
+        });
+        setFeedbackComment("");
+        setFeedbackCategory("other");
+        setShowFeedbackForm(false);
+      }
+    } catch (err) {
+      console.error("Failed to submit feedback:", err);
+    } finally {
+      setSubmittingFeedback(false);
+    }
+  }
+
+  const categoryLabels: Record<FeedbackCategory, string> = {
+    priority_wrong: "Priority Wrong",
+    action_type_wrong: "Action Type Wrong",
+    delegation_wrong: "Delegation Wrong",
+    missing_context: "Missing Context",
+    not_an_item: "Shouldn't Be an Item",
+    should_split: "Should Be Split",
+    other: "Other",
+  };
 
   if (loading) {
     return <div className="py-12 text-center text-slate-500">Loading...</div>;
@@ -182,6 +231,93 @@ export default function ActionItemDetailPage() {
           Status: <span className="font-medium text-slate-300">{item.status}</span>
         </div>
       )}
+
+      {/* Feedback */}
+      <div>
+        <div className="mb-3 flex items-center justify-between">
+          <h2 className="text-sm font-semibold text-slate-400">Feedback</h2>
+          {!showFeedbackForm && (
+            <button
+              onClick={() => setShowFeedbackForm(true)}
+              className="rounded-md bg-amber-600/20 px-3 py-1 text-xs font-medium text-amber-400 hover:bg-amber-600/30"
+            >
+              Leave Feedback
+            </button>
+          )}
+        </div>
+
+        {showFeedbackForm && (
+          <div className="mb-3 rounded-lg border border-amber-500/20 bg-amber-500/5 p-4">
+            <div className="mb-3">
+              <label className="mb-1 block text-xs font-medium text-slate-400">
+                Category
+              </label>
+              <select
+                value={feedbackCategory}
+                onChange={(e) => setFeedbackCategory(e.target.value as FeedbackCategory)}
+                className="w-full rounded-md border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-slate-200 focus:border-amber-500 focus:outline-none"
+              >
+                {Object.entries(categoryLabels).map(([value, label]) => (
+                  <option key={value} value={value}>
+                    {label}
+                  </option>
+                ))}
+              </select>
+            </div>
+            <div className="mb-3">
+              <label className="mb-1 block text-xs font-medium text-slate-400">
+                Comment
+              </label>
+              <textarea
+                value={feedbackComment}
+                onChange={(e) => setFeedbackComment(e.target.value)}
+                placeholder="What should the system have done differently?"
+                rows={3}
+                className="w-full rounded-md border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-slate-200 placeholder-slate-500 focus:border-amber-500 focus:outline-none"
+              />
+            </div>
+            <div className="flex gap-2">
+              <button
+                onClick={submitFeedback}
+                disabled={submittingFeedback || feedbackComment.length < 5}
+                className="rounded-md bg-amber-600 px-4 py-2 text-sm font-medium text-white hover:bg-amber-700 disabled:opacity-50"
+              >
+                {submittingFeedback ? "Submitting..." : "Submit"}
+              </button>
+              <button
+                onClick={() => {
+                  setShowFeedbackForm(false);
+                  setFeedbackComment("");
+                  setFeedbackCategory("other");
+                }}
+                className="rounded-md bg-slate-800 px-4 py-2 text-sm font-medium text-slate-400 hover:bg-slate-700"
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        )}
+
+        {item.feedback.length > 0 && (
+          <div className="space-y-2">
+            {item.feedback.map((fb) => (
+              <div
+                key={fb.id}
+                className="rounded-lg border border-slate-800 bg-slate-900/50 p-3"
+              >
+                <div className="mb-1 flex items-center gap-2">
+                  <span className="rounded-full bg-amber-500/20 px-2 py-0.5 text-xs font-medium text-amber-400">
+                    {categoryLabels[fb.category]}
+                  </span>
+                  <span className="flex-1" />
+                  <TimeAgo date={fb.created_at} />
+                </div>
+                <p className="text-sm leading-relaxed text-slate-300">{fb.comment}</p>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
 
       {/* Source messages */}
       {item.source_messages.length > 0 && (

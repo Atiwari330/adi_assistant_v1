@@ -536,6 +536,55 @@ export type Database = {
         ];
       };
 
+      action_item_feedback: {
+        Row: {
+          id: string;
+          user_id: string;
+          action_item_id: string;
+          category: Database["public"]["Enums"]["feedback_category"];
+          comment: string;
+          resolved: boolean;
+          created_at: string;
+          updated_at: string;
+        };
+        Insert: {
+          id?: string;
+          user_id: string;
+          action_item_id: string;
+          category: Database["public"]["Enums"]["feedback_category"];
+          comment: string;
+          resolved?: boolean;
+          created_at?: string;
+          updated_at?: string;
+        };
+        Update: {
+          id?: string;
+          user_id?: string;
+          action_item_id?: string;
+          category?: Database["public"]["Enums"]["feedback_category"];
+          comment?: string;
+          resolved?: boolean;
+          created_at?: string;
+          updated_at?: string;
+        };
+        Relationships: [
+          {
+            foreignKeyName: "action_item_feedback_user_id_fkey";
+            columns: ["user_id"];
+            isOneToOne: false;
+            referencedRelation: "users";
+            referencedColumns: ["id"];
+          },
+          {
+            foreignKeyName: "action_item_feedback_action_item_id_fkey";
+            columns: ["action_item_id"];
+            isOneToOne: false;
+            referencedRelation: "action_items";
+            referencedColumns: ["id"];
+          },
+        ];
+      };
+
       action_item_history: {
         Row: {
           id: string;
@@ -617,6 +666,14 @@ export type Database = {
         | "other";
       filter_rule_type: "exclude_domain" | "exclude_address" | "exclude_channel";
       rule_match_type: "email_address" | "email_domain" | "slack_user_id" | "slack_channel";
+      feedback_category:
+        | "priority_wrong"
+        | "action_type_wrong"
+        | "delegation_wrong"
+        | "missing_context"
+        | "not_an_item"
+        | "should_split"
+        | "other";
     };
 
     CompositeTypes: Record<string, never>;
@@ -640,6 +697,7 @@ export type ProcessingRule = Tables["processing_rules"]["Row"];
 export type SourceMessage = Tables["source_messages"]["Row"];
 export type ActionItem = Tables["action_items"]["Row"];
 export type ActionItemSource = Tables["action_item_sources"]["Row"];
+export type ActionItemFeedback = Tables["action_item_feedback"]["Row"];
 export type ActionItemHistory = Tables["action_item_history"]["Row"];
 
 /** Insert types (what you pass to INSERT) */
@@ -652,6 +710,7 @@ export type ProcessingRuleInsert = Tables["processing_rules"]["Insert"];
 export type SourceMessageInsert = Tables["source_messages"]["Insert"];
 export type ActionItemInsert = Tables["action_items"]["Insert"];
 export type ActionItemSourceInsert = Tables["action_item_sources"]["Insert"];
+export type ActionItemFeedbackInsert = Tables["action_item_feedback"]["Insert"];
 
 /** Update types (what you pass to UPDATE) */
 export type ActionItemUpdate = Tables["action_items"]["Update"];
@@ -671,3 +730,4 @@ export type SyncStatusType = Enums["sync_status"];
 export type ContactRelationship = Enums["contact_relationship"];
 export type FilterRuleType = Enums["filter_rule_type"];
 export type RuleMatchType = Enums["rule_match_type"];
+export type FeedbackCategory = Enums["feedback_category"];
