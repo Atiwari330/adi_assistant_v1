@@ -40,6 +40,7 @@ export default function DashboardPage() {
   const [loading, setLoading] = useState(true);
   const [activeTab, setActiveTab] = useState<FilterTab>("active");
   const [stats, setStats] = useState<{ active: number; byPriority: Record<string, number> } | null>(null);
+  const [dismissingIds, setDismissingIds] = useState<Set<string>>(new Set());
 
   const fetchItems = useCallback(async () => {
     setLoading(true);
@@ -95,16 +96,38 @@ export default function DashboardPage() {
   }, [fetchItems, fetchStats]);
 
   async function handleQuickAction(id: string, status: "done" | "dismissed") {
+    // Prevent double-clicks
+    if (dismissingIds.has(id)) return;
+    setDismissingIds((prev) => new Set(prev).add(id));
+
     try {
-      await fetch(`/api/action-items/${id}`, {
+      const res = await fetch(`/api/action-items/${id}`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ status }),
       });
-      setItems((prev) => prev.filter((item) => item.id !== id));
-      fetchStats();
+
+      if (!res.ok) {
+        throw new Error("Failed to update");
+      }
+
+      // Remove from current view after a brief animation delay
+      setTimeout(() => {
+        setItems((prev) => prev.filter((item) => item.id !== id));
+        setDismissingIds((prev) => {
+          const next = new Set(prev);
+          next.delete(id);
+          return next;
+        });
+        fetchStats();
+      }, 300);
     } catch (err) {
       console.error("Failed to update item:", err);
+      setDismissingIds((prev) => {
+        const next = new Set(prev);
+        next.delete(id);
+        return next;
+      });
     }
   }
 
@@ -161,6 +184,7 @@ export default function DashboardPage() {
             <ActionItemCard
               key={item.id}
               item={item}
+              isDismissing={dismissingIds.has(item.id)}
               onDone={() => handleQuickAction(item.id, "done")}
               onDismiss={() => handleQuickAction(item.id, "dismissed")}
             />
@@ -173,15 +197,21 @@ export default function DashboardPage() {
 
 function ActionItemCard({
   item,
+  isDismissing,
   onDone,
   onDismiss,
 }: {
   item: ActionItemRow;
+  isDismissing: boolean;
   onDone: () => void;
   onDismiss: () => void;
 }) {
   return (
-    <div className="group rounded-xl border border-slate-800 bg-slate-900/50 p-4 transition-colors hover:border-slate-700">
+    <div
+      className={`group rounded-xl border border-slate-800 bg-slate-900/50 p-4 transition-all duration-300 hover:border-slate-700 ${
+        isDismissing ? "scale-95 opacity-0" : "scale-100 opacity-100"
+      }`}
+    >
       {/* Top row: priority + action type + time */}
       <div className="mb-2 flex items-center gap-2">
         <PriorityBadge priority={item.priority} />
@@ -219,13 +249,15 @@ function ActionItemCard({
         <div className="flex gap-2 pt-1">
           <button
             onClick={onDone}
-            className="rounded-lg bg-green-500/10 px-3 py-1.5 text-xs font-medium text-green-400 hover:bg-green-500/20"
+            disabled={isDismissing}
+            className="rounded-lg bg-green-500/10 px-3 py-1.5 text-xs font-medium text-green-400 hover:bg-green-500/20 disabled:opacity-50"
           >
             Done
           </button>
           <button
             onClick={onDismiss}
-            className="rounded-lg bg-slate-700/50 px-3 py-1.5 text-xs font-medium text-slate-400 hover:bg-slate-700"
+            disabled={isDismissing}
+            className="rounded-lg bg-slate-700/50 px-3 py-1.5 text-xs font-medium text-slate-400 hover:bg-slate-700 disabled:opacity-50"
           >
             Dismiss
           </button>
