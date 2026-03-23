@@ -1,0 +1,25 @@
+@import "tailwindcss";
+
+@theme {
+  --color-slate-850: #172033;
+  --color-priority-critical: #ef4444;
+  --color-priority-high: #f97316;
+  --color-priority-medium: #eab308;
+  --color-priority-low: #3b82f6;
+  --color-priority-info: #6b7280;
+}
+
+/* Mobile-first: hide scrollbar for clean app feel */
+body {
+  -webkit-tap-highlight-color: transparent;
+}
+
+/* Standalone PWA: account for safe areas on notched devices */
+@supports (padding-top: env(safe-area-inset-top)) {
+  .safe-top {
+    padding-top: env(safe-area-inset-top);
+  }
+  .safe-bottom {
+    padding-bottom: env(safe-area-inset-bottom);
+  }
+}
